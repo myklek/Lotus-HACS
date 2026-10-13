@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import timedelta
 import json
@@ -9,24 +10,32 @@ import logging
 import time
 from typing import Any
 
+import aiohttp
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .client import LotusGameStream, normalize_code
+from .client import (
+    LotusGameStream,
+    card_id_from_image,
+    fetch_card_name,
+    normalize_code,
+)
 from .const import (
     CONF_CODE,
     CONF_SLOTS,
     COUNTER_NAMES,
     DEFAULT_SLOTS,
     DOMAIN,
+    EVENT_GAME_RECORDED,
     EVENT_GAME_WON,
     EVENT_LIFE_CHANGED,
     EVENT_NEW_GAME,
     EVENT_PLAYER_ELIMINATED,
     EVENT_TURN_CHANGED,
+    GAMES_FILE,
     HOST_OFFLINE_AFTER,
     MAX_SLOTS,
     PLAYER_COLORS,
@@ -38,6 +47,7 @@ from .const import (
     STATUS_NOT_FOUND,
     WATCH_URL,
 )
+from .gamelog import GameLog, read_records, summarize, write_record
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -52,6 +62,8 @@ class Player:
     life: int | None
     alive: bool
     color: str | None
+    image: str | None
+    commander: str | None
     counters: dict[str, Any]
     commander_damage: dict[str, int]
     commander_damage_max: int
@@ -84,6 +96,8 @@ class Player:
             "alive": self.alive,
             "color": self.color,
             "rgb_color": list(self.rgb_color) if self.rgb_color else None,
+            "commander": self.commander,
+            "image": self.image,
             "is_turn": self.is_turn,
             "is_winner": self.is_winner,
             "monarch": self.is_monarch,
@@ -159,7 +173,10 @@ def _to_int(value: Any) -> int:
         return 0
 
 
-def parse_players(game: dict[str, Any]) -> list[Player]:
+def parse_players(
+    game: dict[str, Any], commanders: dict[str, str | None] | None = None
+) -> list[Player]:
+    """Build players; commanders maps Scryfall card ids to already resolved names."""
     raw = _ordered_players(game)
     names = {p.get("id"): str(p.get("nick") or p.get("id")) for p in raw}
     turn = game.get("turn") if isinstance(game.get("turn"), dict) else {}
@@ -175,6 +192,7 @@ def parse_players(game: dict[str, Any]) -> list[Player]:
             cmd[names[source]] = sum(values)
             cmd_max = max([cmd_max, *values])
         life = p.get("life")
+        image = p.get("image") if isinstance(p.get("image"), str) else None
         result.append(
             Player(
                 slot=slot,
@@ -183,6 +201,8 @@ def parse_players(game: dict[str, Any]) -> list[Player]:
                 life=life if isinstance(life, (int, float)) else None,
                 alive=p.get("alive", True) is not False,
                 color=p.get("color") if isinstance(p.get("color"), str) else None,
+                image=image,
+                commander=(commanders or {}).get(card_id_from_image(image) or ""),
                 counters=dict(p.get("counters") or {}),
                 commander_damage=cmd,
                 commander_damage_max=cmd_max,
@@ -206,6 +226,12 @@ class LotusCoordinator(DataUpdateCoordinator[LotusData]):
         self._raw_state: str | None = None
         self._last_meta_at = 0.0
         self._unsub_timer = None
+        self._commanders: dict[str, str | None] = {}
+        self._commander_lookups: set[str] = set()
+        self._log: GameLog | None = None
+        self._write_lock = asyncio.Lock()
+        self.history: list[dict[str, Any]] = []
+        self.stats: dict[str, Any] = summarize([])
         self.slot_listeners: list[Any] = []
         self.data = LotusData()
 
@@ -217,6 +243,10 @@ class LotusCoordinator(DataUpdateCoordinator[LotusData]):
         return self.data
 
     async def async_start(self) -> None:
+        self.history = await self.hass.async_add_executor_job(
+            read_records, self.hass.config.path(GAMES_FILE)
+        )
+        self.stats = summarize(self.history)
         self._unsub_timer = async_track_time_interval(
             self.hass, self._check_host, timedelta(seconds=15)
         )
@@ -247,6 +277,7 @@ class LotusCoordinator(DataUpdateCoordinator[LotusData]):
             )
         self._raw_meta = self._raw_state = None
         self._last_meta_at = 0.0
+        self._log = None
         self.async_set_updated_data(
             LotusData(code=code, status=STATUS_CONNECTING if code else STATUS_IDLE)
         )
@@ -307,10 +338,90 @@ class LotusCoordinator(DataUpdateCoordinator[LotusData]):
                 previous = data.game
                 data.game = game
                 old_players = data.players
-                data.players = parse_players(game)
+                data.players = parse_players(game, self._commanders)
                 self._grow_slots(len(data.players))
                 self._fire_events(previous, game, old_players, data.players)
+                self._track_game(previous, game, old_players)
+                self._resolve_commanders()
         self.async_set_updated_data(data)
+
+    @callback
+    def _track_game(
+        self,
+        prev: dict[str, Any] | None,
+        game: dict[str, Any],
+        old_players: list[Player],
+    ) -> None:
+        """Feed the game log and save the game once it has a winner."""
+        log = self._log
+        if log is None or log.game_no != game.get("gameNo"):
+            # A game dropped after someone was knocked out is kept, without a winner.
+            if log and prev and not log.winner and log.eliminated:
+                self._save_game(log, prev, old_players)
+            self._log = GameLog(self.data.code, game)
+            return
+        log.update(prev, game)
+        winner = game.get("winner")
+        if winner != log.winner:
+            log.winner = winner
+            if winner:
+                self._save_game(log, game, self.data.players)
+
+    @callback
+    def _save_game(
+        self, log: GameLog, game: dict[str, Any], players: list[Player]
+    ) -> None:
+        record = log.record(game, players)
+        self.history = [g for g in self.history if g["id"] != record["id"]]
+        self.history.append(record)
+        self.stats = summarize(self.history)
+        self.hass.bus.async_fire(
+            EVENT_GAME_RECORDED, {k: v for k, v in record.items() if k != "hits"}
+        )
+        self.entry.async_create_task(
+            self.hass, self._write_game(record), name="lotus_mtg save game"
+        )
+
+    async def _write_game(self, record: dict[str, Any]) -> None:
+        path = self.hass.config.path(GAMES_FILE)
+        async with self._write_lock:
+            try:
+                await self.hass.async_add_executor_job(write_record, path, record)
+            except OSError as err:
+                _LOGGER.warning("Could not save Lotus game to %s: %s", path, err)
+
+    @callback
+    def _resolve_commanders(self) -> None:
+        """Look up the names of commanders seen for the first time."""
+        for player in self.data.players:
+            card_id = card_id_from_image(player.image)
+            if (
+                not card_id
+                or card_id in self._commanders
+                or card_id in self._commander_lookups
+            ):
+                continue
+            self._commander_lookups.add(card_id)
+            self.entry.async_create_background_task(
+                self.hass,
+                self._lookup_commander(card_id),
+                name=f"lotus_mtg commander {card_id}",
+            )
+
+    async def _lookup_commander(self, card_id: str) -> None:
+        try:
+            name = await fetch_card_name(async_get_clientsession(self.hass), card_id)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as err:
+            # Not cached, so the next state update tries again.
+            _LOGGER.debug("Scryfall lookup for %s failed: %s", card_id, err)
+            return
+        finally:
+            self._commander_lookups.discard(card_id)
+        self._commanders[card_id] = name
+        data = self.data
+        if name and data.game:
+            data.players = parse_players(data.game, self._commanders)
+            self.async_set_updated_data(data)
 
     @callback
     def _check_host(self, _now: Any = None) -> None:
@@ -374,7 +485,16 @@ class LotusCoordinator(DataUpdateCoordinator[LotusData]):
             if old.alive and not p.alive:
                 bus.async_fire(EVENT_PLAYER_ELIMINATED, info)
             if p.is_winner and not old.is_winner:
-                bus.async_fire(EVENT_GAME_WON, info)
+                bus.async_fire(
+                    EVENT_GAME_WON,
+                    {
+                        **info,
+                        "commander": p.commander,
+                        "image": p.image,
+                        "game_no": game.get("gameNo"),
+                        "winner_text": game.get("winnerText"),
+                    },
+                )
         old_turn = prev.get("turn") if isinstance(prev.get("turn"), dict) else {}
         turn = game.get("turn") if isinstance(game.get("turn"), dict) else {}
         if turn and (

@@ -12,8 +12,14 @@ AUTH_URL = "https://identitytoolkit.googleapis.com"
 TOKEN_URL = "https://securetoken.googleapis.com"
 WATCH_URL = "https://lifecounter.app/watch/"
 
+# Lotus only sends the commander as a Scryfall art URL; the name is looked up here.
+SCRYFALL_URL = "https://api.scryfall.com"
+
 # The watch page treats the host as offline after 90 s without a meta update.
 HOST_OFFLINE_AFTER = 90
+
+# Finished games are appended here (in the Home Assistant config directory).
+GAMES_FILE = "lotus_mtg_games.jsonl"
 
 DEFAULT_SLOTS = 4
 MAX_SLOTS = 8
@@ -28,6 +34,7 @@ STATUS_DISCONNECTED = "disconnected"
 EVENT_LIFE_CHANGED = f"{DOMAIN}_life_changed"
 EVENT_PLAYER_ELIMINATED = f"{DOMAIN}_player_eliminated"
 EVENT_GAME_WON = f"{DOMAIN}_game_won"
+EVENT_GAME_RECORDED = f"{DOMAIN}_game_recorded"
 EVENT_TURN_CHANGED = f"{DOMAIN}_turn_changed"
 EVENT_NEW_GAME = f"{DOMAIN}_new_game"
 

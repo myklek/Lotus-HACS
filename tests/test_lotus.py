@@ -12,8 +12,19 @@ from pytest_homeassistant_custom_component.common import (
     async_capture_events,
 )
 
-from custom_components.lotus_mtg.client import apply_event, normalize_code
+from custom_components.lotus_mtg.client import (
+    apply_event,
+    card_id_from_image,
+    normalize_code,
+)
 from custom_components.lotus_mtg.const import DOMAIN
+from custom_components.lotus_mtg.coordinator import parse_players
+from custom_components.lotus_mtg.gamelog import (
+    GameLog,
+    read_records,
+    summarize,
+    write_record,
+)
 
 
 def test_normalize_code():
@@ -32,6 +43,18 @@ def test_apply_event():
     assert "state" not in tree
 
 
+JARAD_ID = "c6717954-35d8-4d7e-95aa-f7d26d15d4b2"
+JARAD_IMAGE = (
+    f"https://cards.scryfall.io/art_crop/front/c/6/{JARAD_ID}.jpg?1592673383"
+)
+
+
+def test_card_id_from_image():
+    assert card_id_from_image(JARAD_IMAGE) == JARAD_ID
+    assert card_id_from_image("https://example.com/" + JARAD_ID + ".jpg") is None
+    assert card_id_from_image(None) is None
+
+
 def state(players, **extra):
     return json.dumps({"players": players, "gameNo": 1, **extra})
 
@@ -40,12 +63,112 @@ P1 = {"id": "a", "nick": "Mykolas", "life": 40, "alive": True, "color": "red"}
 P2 = {"id": "b", "nick": "Tomas", "life": 40, "alive": True, "color": "#1e88e5"}
 
 
+@pytest.fixture(autouse=True)
+def saved_games():
+    """Keep finished games out of the config directory and collect them instead."""
+    games = []
+    with patch(
+        "custom_components.lotus_mtg.coordinator.write_record",
+        side_effect=lambda path, record: games.append(record),
+    ):
+        yield games
+
+
+def test_game_log():
+    def game(a, b, c, sent, **extra):
+        return {
+            "gameNo": 3,
+            "startingLife": 40,
+            "clock": {"start": 1_000_000},
+            "sentAt": sent,
+            "players": [
+                {"id": "a", "nick": "Erikas", **a},
+                {"id": "b", "nick": "Mykolas", **b},
+                {"id": "c", "nick": "Domas", **c},
+            ],
+            **extra,
+        }
+
+    full = {"life": 40, "alive": True}
+    states = [
+        game(full, full, full, 1_000_100),
+        # two quick taps of commander damage from Erikas merge into one hit
+        game(full, {"life": 30, "cmd": {"a": [10]}}, full, 1_010_000),
+        game(full, {"life": 19, "cmd": {"a": [21]}, "alive": False}, full, 1_010_400),
+        # a mistap on Domas that is corrected leaves no trace
+        game(full, {"life": 19, "cmd": {"a": [21]}, "alive": False},
+             {"life": 39}, 1_020_000),
+        game(full, {"life": 19, "cmd": {"a": [21]}, "alive": False}, full, 1_020_400),
+        # plain life loss during Domas' turn is credited to Domas
+        game({"life": 0, "alive": False},
+             {"life": 19, "cmd": {"a": [21]}, "alive": False}, full, 1_030_000,
+             turn={"player": "c", "number": 5}, winner="c", winnerText="Victory",
+             clock={"start": 1_000_000, "pausedAt": 1_030_000}),
+    ]
+    log = GameLog("AZA98", states[0])
+    assert not log.partial
+    for prev, new in zip(states, states[1:]):
+        log.update(prev, new)
+    record = log.record(states[-1], parse_players(states[-1], {}))
+
+    assert record["id"] == "AZA98-3-1000000"
+    assert record["winner"] == "Domas"
+    assert record["duration_s"] == 30
+    assert record["turns"] == 5
+    assert [(h["from"], h["to"], h["kind"], h["amount"]) for h in record["hits"]] == [
+        ("Erikas", "Mykolas", "commander", 21),
+        ("Domas", "Erikas", "life", 40),
+    ]
+    by_name = {p["name"]: p for p in record["players"]}
+    assert by_name["Mykolas"]["place"] == 3
+    assert by_name["Mykolas"]["eliminated_by"] == "Erikas"
+    assert by_name["Mykolas"]["commander_damage_taken"] == {"Erikas": 21}
+    assert by_name["Erikas"]["place"] == 2
+    assert by_name["Erikas"]["eliminated_by"] == "Domas"
+    assert by_name["Domas"]["place"] == 1
+    assert {"from": "Erikas", "to": "Mykolas", "kind": "commander", "amount": 21} in (
+        record["damage"]
+    )
+
+    # joining a game that is already under way is flagged
+    assert GameLog("AZA98", states[2]).partial
+
+    stats = summarize([record, {**record, "id": "other", "winner": None}])
+    assert stats["games"] == 1
+    assert stats["unfinished"] == 1
+    assert stats["players"][0] == {
+        "player": "Domas", "games": 1, "wins": 1, "win_rate": 100.0,
+    }
+    assert stats["attackers"][0] == {"player": "Domas", "damage": 80, "knockouts": 2}
+    assert {
+        "from": "Erikas", "to": "Mykolas", "damage": 42,
+        "commander_damage": 42, "knockouts": 2,
+    } in stats["pairs"]
+
+
+def test_write_record(tmp_path):
+    path = str(tmp_path / "games.jsonl")
+    write_record(path, {"id": "x-1", "winner": "A"})
+    write_record(path, {"id": "x-2", "winner": "B"})
+    write_record(path, {"id": "x-1", "winner": "C"})  # winner corrected
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write("not json\n")
+    assert read_records(path) == [
+        {"id": "x-2", "winner": "B"},
+        {"id": "x-1", "winner": "C"},
+    ]
+    assert read_records(str(tmp_path / "missing.jsonl")) == []
+
+
 class FakeFirebase:
     def __init__(self):
         self.queue: asyncio.Queue = asyncio.Queue()
         self.requests = 0
         app = web.Application()
         app.router.add_get("/liveGames/{code}.json", self.handle)
+        app.router.add_get("/cards/{card_id}", self.card)
+        self.cards = {JARAD_ID: "Jarad, Golgari Lich Lord"}
+        self.card_requests = 0
         self.server = TestServer(app, host="127.0.0.1")
 
     async def handle(self, request):
@@ -59,6 +182,13 @@ class FakeFirebase:
             await resp.write(
                 f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
             )
+
+    async def card(self, request):
+        self.card_requests += 1
+        name = self.cards.get(request.match_info["card_id"])
+        if name is None:
+            return web.json_response({"object": "error"}, status=404)
+        return web.json_response({"object": "card", "name": name})
 
     async def send(self, event, data):
         await self.queue.put((event, data))
@@ -74,9 +204,10 @@ async def settle(hass):
 async def fake(socket_enabled):
     fb = FakeFirebase()
     await fb.server.start_server()
-    with patch(
-        "custom_components.lotus_mtg.client.DB_URL",
-        str(fb.server.make_url("")).rstrip("/"),
+    url = str(fb.server.make_url("")).rstrip("/")
+    with (
+        patch("custom_components.lotus_mtg.client.DB_URL", url),
+        patch("custom_components.lotus_mtg.client.SCRYFALL_URL", url),
     ):
         yield fb
     await fb.queue.put((None, None))
@@ -190,6 +321,72 @@ async def test_full_flow(hass, fake):
     await hass.services.async_call(DOMAIN, "set_game_code", {"code": ""}, blocking=True)
     await settle(hass)
     assert hass.states.get("sensor.lotus_mtg_game_status").state == "idle"
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_winner_commander(hass, fake, saved_games):
+    entry = MockConfigEntry(domain=DOMAIN, data={"code": "AZA98"}, unique_id=DOMAIN)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await settle(hass)
+
+    p1 = {**P1, "image": JARAD_IMAGE}
+    await fake.send(
+        "put",
+        {"path": "/", "data": {"meta": {"status": "live"}, "state": state([p1, P2])}},
+    )
+    await settle(hass)
+    commander = hass.states.get("sensor.lotus_mtg_player_1_commander")
+    assert commander.state == "Jarad, Golgari Lich Lord"
+    assert commander.attributes["image"] == JARAD_IMAGE
+    assert hass.states.get("sensor.lotus_mtg_player_2_commander").state == "unknown"
+
+    won = async_capture_events(hass, "lotus_mtg_game_won")
+    recorded = async_capture_events(hass, "lotus_mtg_game_recorded")
+    # Lotus sends the win as a patch on the root, like every other state change
+    await fake.send(
+        "patch",
+        {
+            "path": "/",
+            "data": {
+                "state": state(
+                    [p1, {**P2, "life": 0, "alive": False}],
+                    winner="a",
+                    winnerText="Uncounterable triumph.",
+                ),
+                "meta/updatedAt": 1,
+            },
+        },
+    )
+    await settle(hass)
+    assert won[0].data["player_name"] == "Mykolas"
+    assert won[0].data["commander"] == "Jarad, Golgari Lich Lord"
+    assert won[0].data["game_no"] == 1
+    assert won[0].data["winner_text"] == "Uncounterable triumph."
+    winner = hass.states.get("sensor.lotus_mtg_winner")
+    assert winner.state == "Mykolas"
+    assert winner.attributes["commander"] == "Jarad, Golgari Lich Lord"
+    assert fake.card_requests == 1
+
+    assert recorded[0].data["winner_commander"] == "Jarad, Golgari Lich Lord"
+    assert "hits" not in recorded[0].data
+    assert len(saved_games) == 1
+    game = saved_games[0]
+    assert game["winner"] == "Mykolas"
+    assert [(h["to"], h["kind"], h["amount"]) for h in game["hits"]] == [
+        ("Tomas", "life", 40)
+    ]
+    assert [p["place"] for p in game["players"]] == [1, 2]
+
+    assert hass.states.get("sensor.lotus_mtg_games_recorded").state == "1"
+    most_wins = hass.states.get("sensor.lotus_mtg_most_wins")
+    assert most_wins.state == "Mykolas"
+    assert most_wins.attributes["leaderboard"][0]["win_rate"] == 100.0
+    top = hass.states.get("sensor.lotus_mtg_top_commander")
+    assert top.state == "Jarad, Golgari Lich Lord"
+    assert top.attributes["commanders"][0]["player"] == "Mykolas"
+    assert hass.states.get("sensor.lotus_mtg_top_attacker").state == "unknown"
 
     assert await hass.config_entries.async_unload(entry.entry_id)
 

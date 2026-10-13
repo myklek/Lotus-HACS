@@ -40,6 +40,18 @@ class PlayerSensorDescription(SensorEntityDescription):
     name_suffix: str
 
 
+@dataclass(frozen=True, kw_only=True)
+class StatsSensorDescription(SensorEntityDescription):
+    """Sensor over the saved games; both functions get the coordinator's stats."""
+
+    value_fn: Callable[[dict[str, Any]], Any]
+    attrs_fn: Callable[[dict[str, Any]], dict[str, Any]]
+
+
+def _top(rows: list[dict[str, Any]], key: str, value: str) -> Any:
+    return rows[0][value] if rows and rows[0][key] > 0 else None
+
+
 def _game_attrs(d: LotusData) -> dict[str, Any]:
     game = d.game or {}
     meta = d.meta or {}
@@ -103,7 +115,17 @@ GAME_SENSORS: tuple[GameSensorDescription, ...] = (
         key="winner",
         translation_key="winner",
         value_fn=lambda d: d.winner.name if d.winner else None,
-        attrs_fn=lambda d: {"slot": d.winner.slot} if d.winner else {},
+        attrs_fn=lambda d: (
+            {
+                "slot": d.winner.slot,
+                "commander": d.winner.commander,
+                "image": d.winner.image,
+                "game_no": (d.game or {}).get("gameNo"),
+                "winner_text": (d.game or {}).get("winnerText"),
+            }
+            if d.winner
+            else {}
+        ),
     ),
     GameSensorDescription(
         key="players_alive",
@@ -128,6 +150,12 @@ PLAYER_SENSORS: tuple[PlayerSensorDescription, ...] = (
         value_fn=lambda p: p.name,
     ),
     PlayerSensorDescription(
+        key="commander",
+        name_suffix="commander",
+        icon="mdi:crown",
+        value_fn=lambda p: p.commander,
+    ),
+    PlayerSensorDescription(
         key="poison",
         name_suffix="poison",
         icon="mdi:water",
@@ -140,6 +168,39 @@ PLAYER_SENSORS: tuple[PlayerSensorDescription, ...] = (
         icon="mdi:sword",
         state_class=SensorStateClass.MEASUREMENT,
         value_fn=lambda p: p.commander_damage_max,
+    ),
+)
+
+
+STATS_SENSORS: tuple[StatsSensorDescription, ...] = (
+    StatsSensorDescription(
+        key="games_recorded",
+        translation_key="games_recorded",
+        icon="mdi:counter",
+        state_class=SensorStateClass.TOTAL,
+        value_fn=lambda s: s["games"],
+        attrs_fn=lambda s: {"unfinished": s["unfinished"], "last_game": s["last"]},
+    ),
+    StatsSensorDescription(
+        key="most_wins",
+        translation_key="most_wins",
+        icon="mdi:trophy",
+        value_fn=lambda s: _top(s["players"], "wins", "player"),
+        attrs_fn=lambda s: {"leaderboard": s["players"]},
+    ),
+    StatsSensorDescription(
+        key="top_commander",
+        translation_key="top_commander",
+        icon="mdi:crown",
+        value_fn=lambda s: _top(s["commanders"], "wins", "commander"),
+        attrs_fn=lambda s: {"commanders": s["commanders"]},
+    ),
+    StatsSensorDescription(
+        key="top_attacker",
+        translation_key="top_attacker",
+        icon="mdi:sword-cross",
+        value_fn=lambda s: _top(s["attackers"], "damage", "player"),
+        attrs_fn=lambda s: {"attackers": s["attackers"], "pairs": s["pairs"]},
     ),
 )
 
@@ -161,6 +222,7 @@ async def async_setup_entry(
     entities: list[SensorEntity] = [
         LotusGameSensor(coordinator, desc) for desc in GAME_SENSORS
     ]
+    entities += [LotusStatsSensor(coordinator, desc) for desc in STATS_SENSORS]
     entities += player_entities(coordinator, range(1, coordinator.slots + 1))
     async_add_entities(entities)
 
@@ -191,6 +253,24 @@ class LotusGameSensor(LotusEntity, SensorEntity):
         return fn(self.coordinator.data) if fn else None
 
 
+class LotusStatsSensor(LotusEntity, SensorEntity):
+    entity_description: StatsSensorDescription
+
+    def __init__(
+        self, coordinator: LotusCoordinator, description: StatsSensorDescription
+    ) -> None:
+        super().__init__(coordinator, description.key)
+        self.entity_description = description
+
+    @property
+    def native_value(self) -> Any:
+        return self.entity_description.value_fn(self.coordinator.stats)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return self.entity_description.attrs_fn(self.coordinator.stats)
+
+
 class LotusPlayerSensor(LotusPlayerEntity, SensorEntity):
     entity_description: PlayerSensorDescription
 
@@ -218,4 +298,6 @@ class LotusPlayerSensor(LotusPlayerEntity, SensorEntity):
             return player.attributes()
         if self.entity_description.key == "commander_damage":
             return {"player_name": player.name, "from": player.commander_damage}
+        if self.entity_description.key == "commander":
+            return {"player_name": player.name, "image": player.image}
         return {"player_name": player.name}

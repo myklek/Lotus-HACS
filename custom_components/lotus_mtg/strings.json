@@ -26,7 +26,11 @@
       "turn": { "name": "Turn" },
       "active_player": { "name": "Active player" },
       "winner": { "name": "Winner" },
-      "players_alive": { "name": "Players alive" }
+      "players_alive": { "name": "Players alive" },
+      "games_recorded": { "name": "Games recorded" },
+      "most_wins": { "name": "Most wins" },
+      "top_commander": { "name": "Top commander" },
+      "top_attacker": { "name": "Top attacker" }
     },
     "binary_sensor": {
       "connected": { "name": "Connected" },

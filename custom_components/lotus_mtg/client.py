@@ -15,12 +15,17 @@ from typing import Any
 
 import aiohttp
 
-from .const import API_KEY, AUTH_URL, DB_URL, TOKEN_URL
+from .const import API_KEY, AUTH_URL, DB_URL, SCRYFALL_URL, TOKEN_URL
 
 _LOGGER = logging.getLogger(__name__)
 
 _CODE_RE = re.compile(r"^[A-HJKMNP-Z2-9]{5}$")
 _URL_RE = re.compile(r"/watch/([A-Za-z0-9]+)")
+_CARD_RE = re.compile(
+    r"^https://cards\.scryfall\.io/[^?#]*/"
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.",
+    re.IGNORECASE,
+)
 
 
 def normalize_code(value: str | None) -> str | None:
@@ -31,6 +36,27 @@ def normalize_code(value: str | None) -> str | None:
         raw = match.group(1)
     code = re.sub(r"[^A-Z0-9]", "", raw.upper())
     return code if _CODE_RE.match(code) else None
+
+
+def card_id_from_image(url: Any) -> str | None:
+    """Return the Scryfall card id behind a player's background image, else None."""
+    match = _CARD_RE.match(url) if isinstance(url, str) else None
+    return match.group(1).lower() if match else None
+
+
+async def fetch_card_name(session: aiohttp.ClientSession, card_id: str) -> str | None:
+    """Look up a card name on Scryfall. None means Scryfall does not know the card."""
+    async with session.get(
+        f"{SCRYFALL_URL}/cards/{card_id}",
+        headers={"Accept": "application/json", "User-Agent": "lotus_mtg-homeassistant"},
+        timeout=aiohttp.ClientTimeout(total=15),
+    ) as resp:
+        if resp.status == 404:
+            return None
+        resp.raise_for_status()
+        data = await resp.json(content_type=None)
+    name = data.get("name") if isinstance(data, dict) else None
+    return name if isinstance(name, str) and name else None
 
 
 def apply_event(root: Any, path: str | None, data: Any, merge: bool) -> Any:
