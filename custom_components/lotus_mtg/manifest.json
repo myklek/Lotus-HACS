@@ -1,0 +1,12 @@
+{
+  "domain": "lotus_mtg",
+  "name": "Lotus MTG Life Counter",
+  "codeowners": ["@myklek"],
+  "config_flow": true,
+  "documentation": "https://github.com/myklek/Lotus-HACS",
+  "integration_type": "service",
+  "iot_class": "cloud_push",
+  "issue_tracker": "https://github.com/myklek/Lotus-HACS/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

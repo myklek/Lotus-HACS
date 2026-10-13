@@ -1,0 +1,7 @@
+set_game_code:
+  fields:
+    code:
+      required: true
+      example: "AZA98"
+      selector:
+        text:

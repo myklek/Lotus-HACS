@@ -1,0 +1,48 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Lotus MTG Life Counter",
+        "description": "Optional: enter the game code from Lotus → Menu → Cast to TV (or paste the watch link). You can change it any time with the Game code entity.",
+        "data": { "code": "Game code" }
+      }
+    },
+    "error": { "invalid_code": "Game codes are 5 letters and numbers, like K7QX2." },
+    "abort": { "already_configured": "Lotus MTG is already set up. Change the game code with the Game code entity." }
+  },
+  "entity": {
+    "sensor": {
+      "status": {
+        "name": "Game status",
+        "state": {
+          "idle": "No game code",
+          "connecting": "Connecting",
+          "live": "Live",
+          "ended": "Ended",
+          "not_found": "Game not found",
+          "disconnected": "Disconnected"
+        }
+      },
+      "turn": { "name": "Turn" },
+      "active_player": { "name": "Active player" },
+      "winner": { "name": "Winner" },
+      "players_alive": { "name": "Players alive" }
+    },
+    "binary_sensor": {
+      "connected": { "name": "Connected" },
+      "host_online": { "name": "Host online" }
+    },
+    "text": {
+      "game_code": { "name": "Game code" }
+    }
+  },
+  "services": {
+    "set_game_code": {
+      "name": "Set game code",
+      "description": "Follow another Lotus game. Leave empty to stop.",
+      "fields": {
+        "code": { "name": "Game code", "description": "5 character code or a lifecounter.app/watch link." }
+      }
+    }
+  }
+}
